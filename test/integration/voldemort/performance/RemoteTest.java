@@ -17,12 +17,16 @@
 package voldemort.performance;
 
 import java.io.BufferedReader;
+import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,14 +41,18 @@ import voldemort.client.SocketStoreClientFactory;
 import voldemort.client.StoreClient;
 import voldemort.client.StoreClientFactory;
 import voldemort.utils.CmdUtils;
+import voldemort.versioning.Occured;
+import voldemort.versioning.VectorClock;
 import voldemort.versioning.Versioned;
 
 public class RemoteTest {
 
     public static final int MAX_WORKERS = 8;
+    public static Map<Integer, VectorClock> vectorClockMap = new HashMap<Integer, VectorClock>();
 
     public static class KeyProvider {
 
+        private static final int MILLION = 1 * 1000 * 1000;
         private final List<String> keys;
         private final AtomicInteger index;
 
@@ -53,11 +61,11 @@ public class RemoteTest {
             this.keys = keys;
         }
 
-        public String next() {
+        public Integer next() {
             if(keys != null) {
-                return keys.get(index.getAndIncrement() % keys.size());
+                return Integer.parseInt(keys.get(index.getAndIncrement() % keys.size()));
             } else {
-                return Integer.toString(index.getAndIncrement());
+                return MILLION + (int) (Math.random() * (50 * MILLION));
             }
         }
     }
@@ -75,7 +83,9 @@ public class RemoteTest {
         parser.accepts("r", "execute read operations");
         parser.accepts("w", "execute write operations");
         parser.accepts("d", "execute delete operations");
-        parser.accepts("request-file", "execute specific requests in order").withRequiredArg();
+        parser.accepts("request-file", "execute specific requests in order")
+              .withRequiredArg()
+              .ofType(String.class);
         parser.accepts("start-key-index", "starting point when using int keys. Default = 0")
               .withRequiredArg()
               .ofType(Integer.class);
@@ -88,6 +98,9 @@ public class RemoteTest {
         parser.accepts("threads", "max number concurrent worker threads  Default = " + MAX_WORKERS)
               .withRequiredArg()
               .ofType(Integer.class);
+        parser.accepts("saveValidKeys", "should we save all valid keys in a file Default = false")
+              .withRequiredArg()
+              .ofType(Boolean.class);
 
         OptionSet options = parser.parse(args);
 
@@ -106,8 +119,11 @@ public class RemoteTest {
         Integer valueSize = CmdUtils.valueOf(options, "value-size", 1024);
         Integer numIterations = CmdUtils.valueOf(options, "iterations", 1);
         Integer numThreads = CmdUtils.valueOf(options, "threads", MAX_WORKERS);
+        final Boolean saveValidKeys = CmdUtils.valueOf(options, "saveValidKeys", false);
 
-        if(options.has("request-file")) {
+        final DataOutputStream dos = (saveValidKeys) ? new DataOutputStream(new FileOutputStream(new File((String) options.valueOf("request-file"))))
+                                                    : null;
+        if(!saveValidKeys && options.has("request-file")) {
             keys = loadKeys((String) options.valueOf("request-file"));
         }
 
@@ -120,7 +136,6 @@ public class RemoteTest {
         if(options.has("d")) {
             ops += "d";
         }
-
         if(ops.length() == 0) {
             ops = "rwd";
         }
@@ -141,56 +156,14 @@ public class RemoteTest {
                                                                                     .setSocketTimeout(60,
                                                                                                       TimeUnit.SECONDS)
                                                                                     .setSocketBufferSize(4 * 1024));
-        final StoreClient<String, String> store = factory.getStoreClient(storeName);
-
-        final String value = TestUtils.randomLetters(valueSize);
+        final StoreClient<Integer, byte[]> store = factory.getStoreClient(storeName);
+        final byte[] value = TestUtils.randomLetters(valueSize).getBytes();
         ExecutorService service = Executors.newFixedThreadPool(numThreads);
-
-        /*
-         * send the store a value and then delete it - useful for the NOOP store
-         * which will then use that value for other queries
-         */
-
-        final String key = new KeyProvider(startNum, keys).next();
-
-        // We need to delete just in case there's an existing value there that
-        // would otherwise cause the test run to bomb out.
-        store.delete(key);
-        store.put(key, new Versioned<String>(value));
-        store.delete(key);
 
         for(int loopCount = 0; loopCount < numIterations; loopCount++) {
 
             System.out.println("======================= iteration = " + loopCount
                                + " ======================================");
-
-            if(ops.contains("d")) {
-                System.out.println("Beginning delete test.");
-                final AtomicInteger successes = new AtomicInteger(0);
-                final KeyProvider keyProvider0 = new KeyProvider(startNum, keys);
-                final CountDownLatch latch0 = new CountDownLatch(numRequests);
-                long start = System.currentTimeMillis();
-                for(int i = 0; i < numRequests; i++) {
-                    service.execute(new Runnable() {
-
-                        public void run() {
-                            try {
-                                store.delete(keyProvider0.next());
-                                successes.getAndIncrement();
-                            } catch(Exception e) {
-                                e.printStackTrace();
-                            } finally {
-                                latch0.countDown();
-                            }
-                        }
-                    });
-                }
-                latch0.await();
-                long deleteTime = System.currentTimeMillis() - start;
-                System.out.println("Throughput: " + (numRequests / (float) deleteTime * 1000)
-                                   + " deletes/sec.");
-                System.out.println(successes.get() + " things deleted.");
-            }
 
             if(ops.contains("w")) {
                 System.out.println("Beginning write test.");
@@ -202,7 +175,7 @@ public class RemoteTest {
 
                         public void run() {
                             try {
-                                String key = keyProvider1.next();
+                                Integer key = keyProvider1.next();
                                 store.put(key, value);
                             } catch(Exception e) {
                                 e.printStackTrace();
@@ -229,20 +202,26 @@ public class RemoteTest {
 
                         public void run() {
                             try {
-                                String key = keyProvider2.next();
-                                Versioned<String> v = store.get(key);
+                                Integer key = keyProvider2.next();
+                                Versioned<byte[]> v = store.get(key);
 
                                 if(v == null) {
                                     throw new Exception("value returned is null for key " + key);
+                                } else {
+                                    if(saveValidKeys) {
+                                        dos.writeUTF(Integer.toString(key) + "\n");
+                                    } else {
+                                        // do a put ()
+                                        store.put(key, v);
+                                        Versioned<byte[]> v2 = store.get(key);
+                                        VectorClock oldClock = (VectorClock) v.getVersion();
+                                        VectorClock newClock = (VectorClock) v2.getVersion();
+                                        if(newClock.compare(oldClock) != Occured.AFTER) {
+                                            throw new Exception("stale value returnded for key:"
+                                                                + key);
+                                        }
+                                    }
                                 }
-
-                                if(!value.equals(v.getValue())) {
-                                    throw new Exception("value returned isn't same as set value.  My val size = "
-                                                        + value.length()
-                                                        + " ret size = "
-                                                        + v.getValue().length() + " for key " + key);
-                                }
-
                             } catch(Exception e) {
                                 e.printStackTrace();
                             } finally {
@@ -257,7 +236,6 @@ public class RemoteTest {
                                    + " reads/sec.");
             }
         }
-
         System.exit(0);
     }
 
@@ -271,7 +249,9 @@ public class RemoteTest {
             reader = new BufferedReader(new FileReader(file));
             String text;
             while((text = reader.readLine()) != null) {
-                targets.add(text);
+                String numberString = text.trim();
+                if(numberString.length() > 0)
+                    targets.add(numberString);
             }
         } finally {
             try {

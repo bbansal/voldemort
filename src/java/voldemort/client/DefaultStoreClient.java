@@ -246,6 +246,8 @@ public class DefaultStoreClient<K, V> implements StoreClient<K, V> {
         RoutingStrategy strategy = (RoutingStrategy) store.getCapability(StoreCapabilityType.ROUTING_STRATEGY);
         @SuppressWarnings("unchecked")
         Serializer<K> keySerializer = (Serializer<K>) store.getCapability(StoreCapabilityType.KEY_SERIALIZER);
+        System.out.println("key " + key + " belongs to partitionList "
+                           + strategy.getPartitionList(keySerializer.toBytes(key)));
         return strategy.routeRequest(keySerializer.toBytes(key));
     }
 
